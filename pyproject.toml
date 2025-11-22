@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logward-sdk"
+version = "0.1.0"
+description = "Official Python SDK for LogWard - Self-hosted log management with batching, retry logic, circuit breaker, query API, and middleware support"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Polliog", email = "giuseppe@solture.it"}]
+requires-python = ">=3.8"
+keywords = [
+    "logward",
+    "logging",
+    "logs",
+    "log-management",
+    "monitoring",
+    "observability",
+    "self-hosted",
+    "tracing",
+    "circuit-breaker",
+    "flask",
+    "django",
+    "fastapi"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Logging",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+async = ["aiohttp>=3.9.0"]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "mypy>=1.5.0",
+    "ruff>=0.1.0",
+    "types-requests>=2.31.0",
+]
+flask = ["flask>=2.0.0"]
+django = ["django>=3.2.0"]
+fastapi = ["fastapi>=0.100.0", "starlette>=0.27.0"]
+
+[project.urls]
+Homepage = "https://github.com/logward-dev/logward-sdk-python"
+Repository = "https://github.com/logward-dev/logward-sdk-python"
+Documentation = "https://logward.dev/docs"
+Issues = "https://github.com/logward-dev/logward-sdk-python/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["logward_sdk*"]
+
+[tool.setuptools.package-data]
+logward_sdk = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311", "py312"]
+
+[tool.mypy]
+python_version = "3.8"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
