@@ -57,10 +57,10 @@ django = ["django>=3.2.0"]
 fastapi = ["fastapi>=0.100.0", "starlette>=0.27.0"]
 
 [project.urls]
-Homepage = "https://github.com/logtide-dev/python-sdk"
-Repository = "https://github.com/logtide-dev/python-sdk"
+Homepage = "https://github.com/logtide-dev/logtide-sdk-python"
+Repository = "https://github.com/logtide-dev/logtide-sdk-python"
 Documentation = "https://logtide.dev/docs"
-Issues = "https://github.com/logtide-dev/python-sdk/issues"
+Issues = "https://github.com/logtide-dev/logtide-sdk-python/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
