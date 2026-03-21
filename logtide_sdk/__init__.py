@@ -23,7 +23,7 @@ from .models import (
     QueryOptions,
 )
 
-__version__ = "0.8.4rc1"
+__version__ = "0.8.4"
 
 __all__ = [
     # Clients
