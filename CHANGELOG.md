@@ -79,5 +79,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - FastAPI middleware for auto-logging HTTP requests
 - Full type hints support for Python 3.8+
 
-[0.8.4]: https://github.com/logtide-dev/logtide-sdk-python/compare/v0.1.0...v0.8.4
-[0.1.0]: https://github.com/logtide-dev/logtide-sdk-python/releases/tag/v0.1.0
+[0.8.4]: https://github.com/logtide-dev/logtide-python/compare/v0.1.0...v0.8.4
+[0.1.0]: https://github.com/logtide-dev/logtide-python/releases/tag/v0.1.0

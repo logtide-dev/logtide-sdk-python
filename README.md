@@ -8,7 +8,7 @@
   <a href="https://pypi.org/project/logtide-sdk/"><img src="https://img.shields.io/pypi/v/logtide-sdk?color=blue" alt="PyPI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.8+-blue.svg" alt="Python"></a>
-  <a href="https://github.com/logtide-dev/logtide-sdk-python/releases"><img src="https://img.shields.io/github/v/release/logtide-dev/logtide-sdk-python" alt="Release"></a>
+  <a href="https://github.com/logtide-dev/logtide-python/releases"><img src="https://img.shields.io/github/v/release/logtide-dev/logtide-python" alt="Release"></a>
 </p>
 
 <p align="center">
@@ -523,4 +523,4 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 - [LogTide Website](https://logtide.dev)
 - [Documentation](https://logtide.dev/docs/sdks/python/)
-- [GitHub Issues](https://github.com/logtide-dev/logtide-sdk-python/issues)
+- [GitHub Issues](https://github.com/logtide-dev/logtide-python/issues)
