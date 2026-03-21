@@ -4,14 +4,15 @@ import time
 from typing import Optional
 
 try:
-    from flask import Flask, Request, Response, g, request
+    from flask import Flask, Request, Response, g, make_response, request
+    import werkzeug.exceptions as _werkzeug_exc
 except ImportError:
     raise ImportError(
         "Flask is required for LogTideFlaskMiddleware. "
         "Install it with: pip install logtide-sdk[flask]"
     )
 
-from ..client import LogTideClient
+from ..client import LogTideClient, serialize_exception
 
 
 class LogTideFlaskMiddleware:
@@ -63,7 +64,7 @@ class LogTideFlaskMiddleware:
         self.log_errors = log_errors
         self.include_headers = include_headers
         self.include_body = include_body
-        self.skip_paths = skip_paths or []
+        self.skip_paths: list = list(skip_paths or [])
 
         if skip_health_check:
             self.skip_paths.extend(["/health", "/healthz"])
@@ -98,10 +99,11 @@ class LogTideFlaskMiddleware:
         if self.include_body and request.is_json:
             metadata["body"] = request.get_json(silent=True)
 
-        # Extract trace ID from headers
+        # Extract trace ID from headers (kept local — not set on the shared client
+        # to avoid race conditions across concurrent requests).
         trace_id = request.headers.get("X-Trace-ID")
         if trace_id:
-            self.client.set_trace_id(trace_id)
+            metadata["trace_id"] = trace_id
 
         self.client.info(
             self.service_name,
@@ -131,8 +133,12 @@ class LogTideFlaskMiddleware:
         if self.include_headers:
             metadata["response_headers"] = dict(response.headers)
 
-        if self.include_body and response.is_json:
-            metadata["response_body"] = response.get_json(silent=True)
+        if self.include_body and response.content_type and "application/json" in response.content_type:
+            try:
+                import json as _json
+                metadata["response_body"] = _json.loads(response.get_data(as_text=True))
+            except Exception:
+                pass
 
         # Use appropriate log level based on status code
         if response.status_code >= 500:
@@ -156,10 +162,19 @@ class LogTideFlaskMiddleware:
 
         return response
 
-    def _error_handler(self, error: Exception) -> None:
-        """Log error."""
+    def _error_handler(self, error: Exception) -> Response:
+        """Log error and return a response.
+
+        Returning a Response (instead of re-raising) ensures Flask still executes
+        after_request handlers, so _after_request can log the 500 response too.
+        """
+        if isinstance(error, _werkzeug_exc.HTTPException):
+            resp: Response = error.get_response()
+        else:
+            resp = make_response("Internal Server Error", 500)
+
         if not self.log_errors or self._should_skip(request.path):
-            raise error
+            return resp
 
         duration_ms = 0
         if hasattr(g, "logtide_start_time"):
@@ -172,8 +187,8 @@ class LogTideFlaskMiddleware:
                 "method": request.method,
                 "path": request.path,
                 "duration_ms": round(duration_ms, 2),
-                "error": error,
+                "exception": serialize_exception(error),
             },
         )
 
-        raise error
+        return resp

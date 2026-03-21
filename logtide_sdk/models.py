@@ -1,10 +1,20 @@
 """Data models for LogTide SDK."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from .enums import LogLevel
+
+
+@dataclass
+class PayloadLimitsOptions:
+    """Options for controlling log payload sizes to prevent 413 errors."""
+
+    max_field_size: int = 10 * 1024  # 10 KB — truncate individual string fields above this
+    max_log_size: int = 100 * 1024  # 100 KB — drop metadata entirely if entry exceeds this
+    exclude_fields: List[str] = field(default_factory=list)  # field names to redact
+    truncation_marker: str = "...[TRUNCATED]"  # appended to truncated strings
 
 
 @dataclass
@@ -21,7 +31,7 @@ class LogEntry:
     def __post_init__(self) -> None:
         """Initialize default values."""
         if self.time is None:
-            self.time = datetime.utcnow().isoformat() + "Z"
+            self.time = datetime.now(timezone.utc).isoformat()
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -52,6 +62,7 @@ class ClientOptions:
     debug: bool = False
     global_metadata: Dict[str, Any] = field(default_factory=dict)
     auto_trace_id: bool = False
+    payload_limits: Optional[PayloadLimitsOptions] = None
 
 
 @dataclass

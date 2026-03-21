@@ -92,7 +92,7 @@ stats = client.get_aggregated_stats(
 print("Top services:", stats.top_services)
 print("Top errors:", stats.top_errors)
 
-# Live streaming
+# Live streaming — non-blocking, returns a stop function
 def handle_log(log):
     print(f"[{log['time']}] {log['level']}: {log['message']}")
 
@@ -101,8 +101,10 @@ def handle_error(error):
     print(f"Stream error: {error}")
 
 
-# Note: This blocks. Run in separate thread for production
-# client.stream(on_log=handle_log, on_error=handle_error, filters={'level': 'error'})
+# stream() starts a background daemon thread and returns immediately
+stop = client.stream(on_log=handle_log, on_error=handle_error, filters={"level": "error"})
+# When done streaming:
+# stop()
 
 # Metrics
 metrics = client.get_metrics()

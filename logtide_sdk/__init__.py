@@ -1,8 +1,17 @@
 """LogTide SDK - Official Python SDK for LogTide."""
 
-from .client import LogTideClient
+from .client import LogTideClient, serialize_exception
+
+_has_async = False
+try:
+    from .async_client import AsyncLogTideClient
+
+    _has_async = True
+except ImportError:
+    pass  # type: ignore[assignment]
 from .enums import CircuitState, LogLevel
 from .exceptions import BufferFullError, CircuitBreakerOpenError, LogTideError
+from .handler import LogTideHandler
 from .models import (
     AggregatedStatsOptions,
     AggregatedStatsResponse,
@@ -10,14 +19,19 @@ from .models import (
     ClientOptions,
     LogEntry,
     LogsResponse,
+    PayloadLimitsOptions,
     QueryOptions,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.8.4rc1"
 
 __all__ = [
-    # Client
+    # Clients
     "LogTideClient",
+    # Logging integration
+    "LogTideHandler",
+    # Error serialization utility
+    "serialize_exception",
     # Models
     "LogEntry",
     "ClientOptions",
@@ -26,6 +40,7 @@ __all__ = [
     "ClientMetrics",
     "LogsResponse",
     "AggregatedStatsResponse",
+    "PayloadLimitsOptions",
     # Enums
     "LogLevel",
     "CircuitState",
@@ -34,3 +49,6 @@ __all__ = [
     "CircuitBreakerOpenError",
     "BufferFullError",
 ]
+
+if _has_async:
+    __all__.append("AsyncLogTideClient")

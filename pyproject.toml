@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "logtide-sdk"
-version = "0.1.2"
-description = "Official Python SDK for LogTide - Self-hosted log management with batching, retry logic, circuit breaker, query API, and middleware support"
+version = "0.8.4rc1"
+description = "Official Python SDK for LogTide - Self-hosted log management with async client, logging integration, batching, retry, circuit breaker, and middleware"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Polliog", email = "giuseppe@solture.it"}]
@@ -20,9 +20,11 @@ keywords = [
     "self-hosted",
     "tracing",
     "circuit-breaker",
+    "asyncio",
     "flask",
     "django",
-    "fastapi"
+    "fastapi",
+    "starlette"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -36,6 +38,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: System :: Logging",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Framework :: AsyncIO",
 ]
 
 dependencies = [
@@ -44,6 +47,7 @@ dependencies = [
 
 [project.optional-dependencies]
 async = ["aiohttp>=3.9.0"]
+starlette = ["starlette>=0.27.0"]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
@@ -93,3 +97,4 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+asyncio_mode = "auto"
