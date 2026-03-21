@@ -12,7 +12,7 @@ except ImportError:
         "Install it with: pip install logtide-sdk[django]"
     )
 
-from ..client import LogTideClient
+from ..client import LogTideClient, serialize_exception
 
 
 class LogTideDjangoMiddleware:
@@ -53,7 +53,7 @@ class LogTideDjangoMiddleware:
         self.log_errors: bool = getattr(settings, "LOGTIDE_LOG_ERRORS", True)
         self.include_headers: bool = getattr(settings, "LOGTIDE_INCLUDE_HEADERS", False)
         self.skip_health_check: bool = getattr(settings, "LOGTIDE_SKIP_HEALTH_CHECK", True)
-        self.skip_paths: list = getattr(settings, "LOGTIDE_SKIP_PATHS", [])
+        self.skip_paths: list = list(getattr(settings, "LOGTIDE_SKIP_PATHS", []))
 
         if self.skip_health_check:
             self.skip_paths.extend(["/health", "/health/", "/healthz", "/healthz/"])
@@ -64,15 +64,14 @@ class LogTideDjangoMiddleware:
         if self._should_skip(request.path):
             return self.get_response(request)
 
-        # Extract trace ID from headers
-        trace_id = request.headers.get("X-Trace-ID")
-        if trace_id:
-            self.client.set_trace_id(trace_id)
+        # Extract trace ID from headers (kept local — not set on the shared client
+        # to avoid race conditions across concurrent requests).
+        trace_id: Optional[str] = request.headers.get("X-Trace-ID")
 
         # Log request
         start_time = time.time()
         if self.log_requests:
-            self._log_request(request)
+            self._log_request(request, trace_id)
 
         # Process request
         try:
@@ -81,13 +80,13 @@ class LogTideDjangoMiddleware:
             # Log error
             if self.log_errors:
                 duration_ms = (time.time() - start_time) * 1000
-                self._log_error(request, e, duration_ms)
+                self._log_error(request, e, duration_ms, trace_id)
             raise
 
         # Log response
         if self.log_responses:
             duration_ms = (time.time() - start_time) * 1000
-            self._log_response(request, response, duration_ms)
+            self._log_response(request, response, duration_ms, trace_id)
 
         return response
 
@@ -95,16 +94,17 @@ class LogTideDjangoMiddleware:
         """Check if path should be skipped."""
         return path in self.skip_paths
 
-    def _log_request(self, request: HttpRequest) -> None:
+    def _log_request(self, request: HttpRequest, trace_id: Optional[str] = None) -> None:
         """Log incoming request."""
         metadata = {
             "method": request.method,
             "path": request.path,
             "ip": self._get_client_ip(request),
         }
-
         if self.include_headers:
             metadata["headers"] = dict(request.headers)
+        if trace_id:
+            metadata["trace_id"] = trace_id
 
         self.client.info(
             self.service_name,
@@ -113,7 +113,7 @@ class LogTideDjangoMiddleware:
         )
 
     def _log_response(
-        self, request: HttpRequest, response: HttpResponse, duration_ms: float
+        self, request: HttpRequest, response: HttpResponse, duration_ms: float, trace_id: Optional[str] = None
     ) -> None:
         """Log response."""
         metadata = {
@@ -122,16 +122,16 @@ class LogTideDjangoMiddleware:
             "status": response.status_code,
             "duration_ms": round(duration_ms, 2),
         }
-
         if self.include_headers:
             metadata["response_headers"] = dict(response.items())
+        if trace_id:
+            metadata["trace_id"] = trace_id
 
         message = (
             f"{request.method} {request.path} "
             f"{response.status_code} ({duration_ms:.0f}ms)"
         )
 
-        # Use appropriate log level based on status code
         if response.status_code >= 500:
             self.client.error(self.service_name, message, metadata)
         elif response.status_code >= 400:
@@ -140,18 +140,21 @@ class LogTideDjangoMiddleware:
             self.client.info(self.service_name, message, metadata)
 
     def _log_error(
-        self, request: HttpRequest, error: Exception, duration_ms: float
+        self, request: HttpRequest, error: Exception, duration_ms: float, trace_id: Optional[str] = None
     ) -> None:
         """Log error."""
+        metadata = {
+            "method": request.method,
+            "path": request.path,
+            "duration_ms": round(duration_ms, 2),
+            "exception": serialize_exception(error),
+        }
+        if trace_id:
+            metadata["trace_id"] = trace_id
         self.client.error(
             self.service_name,
             f"Request error: {request.method} {request.path} - {str(error)}",
-            {
-                "method": request.method,
-                "path": request.path,
-                "duration_ms": round(duration_ms, 2),
-                "error": error,
-            },
+            metadata,
         )
 
     def _get_client_ip(self, request: HttpRequest) -> Optional[str]:

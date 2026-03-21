@@ -6,7 +6,7 @@ Thank you for your interest in contributing!
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/logtide-dev/logtide-sdk-python.git
+git clone https://github.com/logtide-dev/logtide-python.git
 cd logtide-sdk-python
 ```
 

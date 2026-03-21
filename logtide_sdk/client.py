@@ -1,18 +1,21 @@
 """Main LogTide SDK client implementation."""
 
 import atexit
+import dataclasses
+import json
+import re
 import time
 import traceback
 import uuid
 from contextlib import contextmanager
-from threading import Lock, Timer
+from threading import Event, Lock, Thread, Timer
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 import requests
 
 from .circuit_breaker import CircuitBreaker
 from .enums import CircuitState, LogLevel
-from .exceptions import BufferFullError, CircuitBreakerOpenError
+from .exceptions import CircuitBreakerOpenError
 from .models import (
     AggregatedStatsOptions,
     AggregatedStatsResponse,
@@ -20,16 +23,95 @@ from .models import (
     ClientOptions,
     LogEntry,
     LogsResponse,
+    PayloadLimitsOptions,
     QueryOptions,
 )
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (importable by async_client and middleware)
+# ---------------------------------------------------------------------------
+
+_BASE64_RE = re.compile(r"^[A-Za-z0-9+/=]{100,}$")
+
+
+def _looks_like_base64(s: str) -> bool:
+    """Return True if the string looks like base64-encoded or data-URI data."""
+    if s.startswith("data:"):
+        return True
+    return bool(_BASE64_RE.match(s.replace("\n", "").replace("\r", "")))
+
+
+def serialize_exception(exc: BaseException) -> Dict[str, Any]:
+    """
+    Serialize an exception into a structured format.
+
+    Returns a dict with keys: type, message, language, stacktrace, raw.
+    stacktrace is a list of frame dicts: {file, function, line}.
+    Chained exceptions (exc.__cause__) are serialized recursively as 'cause'.
+    """
+    frames: List[Dict[str, Any]] = []
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        frames.append(
+            {
+                "file": frame.f_code.co_filename,
+                "function": frame.f_code.co_name,
+                "line": tb.tb_lineno,
+            }
+        )
+        tb = tb.tb_next
+
+    result: Dict[str, Any] = {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "language": "python",
+        "stacktrace": frames,
+        "raw": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    }
+
+    if exc.__cause__ is not None:
+        result["cause"] = serialize_exception(exc.__cause__)
+
+    return result
+
+
+def _process_value(value: Any, path: str, lim: PayloadLimitsOptions) -> Any:
+    """Recursively apply payload limits to a metadata value."""
+    field_name = path.split(".")[-1]
+    if field_name in lim.exclude_fields:
+        return "[EXCLUDED]"
+
+    if value is None:
+        return value
+
+    if isinstance(value, str):
+        if len(value) >= 100 and _looks_like_base64(value):
+            return "[BASE64 DATA REMOVED]"
+        if len(value) > lim.max_field_size:
+            return value[: lim.max_field_size] + lim.truncation_marker
+        return value
+
+    if isinstance(value, dict):
+        return {k: _process_value(v, f"{path}.{k}", lim) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [_process_value(v, f"{path}[{i}]", lim) for i, v in enumerate(value)]
+
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Main client
+# ---------------------------------------------------------------------------
 
 
 class LogTideClient:
     """
     LogTide SDK Client.
 
-    Main client for sending logs to LogTide with automatic batching,
-    retry logic, circuit breaker, and query capabilities.
+    Main client for sending structured logs to LogTide with automatic batching,
+    retry logic, circuit breaker, connection reuse, and query capabilities.
     """
 
     def __init__(self, options: ClientOptions) -> None:
@@ -52,28 +134,33 @@ class LogTideClient:
         self._latency_window: List[float] = []
         self._flush_timer: Optional[Timer] = None
         self._closed = False
+        self._payload_limits = options.payload_limits or PayloadLimitsOptions()
 
-        # Register cleanup on exit
+        # Persistent HTTP session for connection reuse across requests
+        self._session = requests.Session()
+
+        # Register cleanup on interpreter exit
         atexit.register(self.close)
 
-        # Start flush timer if interval is set
+        # Start timer-based auto-flush
         if options.flush_interval > 0:
             self._schedule_flush()
 
         if self.options.debug:
             print(f"[LogTide] Client initialized: {options.api_url}")
 
+    # -----------------------------------------------------------------------
+    # Trace ID helpers
+    # -----------------------------------------------------------------------
+
     def set_trace_id(self, trace_id: Optional[str]) -> None:
         """
         Set trace ID for subsequent logs.
 
         Args:
-            trace_id: Trace ID or None to clear
+            trace_id: Trace ID string, or None to clear
         """
-        if trace_id is not None:
-            self._trace_id = self._normalize_trace_id(trace_id)
-        else:
-            self._trace_id = None
+        self._trace_id = trace_id
 
     def get_trace_id(self) -> Optional[str]:
         """
@@ -87,7 +174,8 @@ class LogTideClient:
     @contextmanager
     def with_trace_id(self, trace_id: str) -> Iterator[None]:
         """
-        Context manager for scoped trace ID.
+        Context manager that sets a trace ID for the duration of the block,
+        then restores the previous value.
 
         Args:
             trace_id: Trace ID to use within context
@@ -97,7 +185,7 @@ class LogTideClient:
                 client.info('api', 'Processing request')
         """
         old_trace_id = self._trace_id
-        self.set_trace_id(trace_id)
+        self._trace_id = trace_id
         try:
             yield
         finally:
@@ -106,19 +194,23 @@ class LogTideClient:
     @contextmanager
     def with_new_trace_id(self) -> Iterator[None]:
         """
-        Context manager with auto-generated trace ID.
+        Context manager with an auto-generated UUID trace ID.
 
         Example:
             with client.with_new_trace_id():
                 client.info('worker', 'Background job')
         """
-        new_trace_id = str(uuid.uuid4())
-        with self.with_trace_id(new_trace_id):
+        with self.with_trace_id(str(uuid.uuid4())):
             yield
+
+    # -----------------------------------------------------------------------
+    # Logging methods
+    # -----------------------------------------------------------------------
 
     def log(self, entry: LogEntry) -> None:
         """
-        Log a custom entry.
+        Log a pre-built entry. Applies trace ID, global metadata, and
+        payload limits before buffering. Silently drops when buffer is full.
 
         Args:
             entry: Log entry to send
@@ -126,44 +218,45 @@ class LogTideClient:
         if self._closed:
             return
 
-        # Add trace ID if set
+        # Inject trace ID
         if entry.trace_id is None:
             if self.options.auto_trace_id:
                 entry.trace_id = str(uuid.uuid4())
             elif self._trace_id is not None:
                 entry.trace_id = self._trace_id
 
-        # Merge global metadata
+        # Coerce None to {} so unpacking never raises TypeError
+        if entry.metadata is None:
+            entry.metadata = {}
+
+        # Merge global metadata (entry metadata wins on collision)
         if self.options.global_metadata:
             entry.metadata = {**self.options.global_metadata, **entry.metadata}
 
+        # Apply payload limits before buffering
+        self._apply_payload_limits(entry)
+
+        should_flush = False
         with self._buffer_lock:
-            # Check buffer size
             if len(self._buffer) >= self.options.max_buffer_size:
                 if self.options.debug:
                     print(f"[LogTide] Buffer full, dropping log: {entry.message}")
-
                 with self._metrics_lock:
                     self._metrics.logs_dropped += 1
-                raise BufferFullError("Log buffer is full")
+                return
 
             self._buffer.append(entry)
-
-            # Auto-flush if batch size reached
             if len(self._buffer) >= self.options.batch_size:
-                self.flush()
+                should_flush = True
+
+        # Flush outside the lock to avoid a deadlock on re-entry
+        if should_flush:
+            self.flush()
 
     def debug(
         self, service: str, message: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """
-        Log debug message.
-
-        Args:
-            service: Service name
-            message: Log message
-            metadata: Optional metadata dictionary
-        """
+        """Log a DEBUG-level message."""
         self.log(
             LogEntry(
                 service=service,
@@ -176,14 +269,7 @@ class LogTideClient:
     def info(
         self, service: str, message: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """
-        Log info message.
-
-        Args:
-            service: Service name
-            message: Log message
-            metadata: Optional metadata dictionary
-        """
+        """Log an INFO-level message."""
         self.log(
             LogEntry(
                 service=service,
@@ -196,14 +282,7 @@ class LogTideClient:
     def warn(
         self, service: str, message: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """
-        Log warning message.
-
-        Args:
-            service: Service name
-            message: Log message
-            metadata: Optional metadata dictionary
-        """
+        """Log a WARN-level message."""
         self.log(
             LogEntry(
                 service=service,
@@ -220,12 +299,12 @@ class LogTideClient:
         metadata_or_error: Union[Dict[str, Any], Exception, None] = None,
     ) -> None:
         """
-        Log error message.
+        Log an ERROR-level message.
 
         Args:
             service: Service name
             message: Log message
-            metadata_or_error: Metadata dict or Exception object
+            metadata_or_error: Metadata dict or Exception (serialized automatically)
         """
         metadata = self._process_metadata_or_error(metadata_or_error)
         self.log(
@@ -244,12 +323,12 @@ class LogTideClient:
         metadata_or_error: Union[Dict[str, Any], Exception, None] = None,
     ) -> None:
         """
-        Log critical message.
+        Log a CRITICAL-level message.
 
         Args:
             service: Service name
             message: Log message
-            metadata_or_error: Metadata dict or Exception object
+            metadata_or_error: Metadata dict or Exception (serialized automatically)
         """
         metadata = self._process_metadata_or_error(metadata_or_error)
         self.log(
@@ -261,30 +340,33 @@ class LogTideClient:
             )
         )
 
-    def flush(self) -> None:
-        """Flush buffered logs to LogTide API."""
-        if self._closed:
-            return
+    # -----------------------------------------------------------------------
+    # Flush & send
+    # -----------------------------------------------------------------------
 
+    def flush(self) -> None:
+        """Flush all buffered logs to the LogTide API immediately."""
         with self._buffer_lock:
             if not self._buffer:
                 return
-
             logs_to_send = self._buffer[:]
             self._buffer.clear()
 
-        # Send logs with retry logic
         self._send_logs_with_retry(logs_to_send)
+
+    # -----------------------------------------------------------------------
+    # Query / read API
+    # -----------------------------------------------------------------------
 
     def query(self, options: QueryOptions) -> LogsResponse:
         """
         Query logs with filters.
 
         Args:
-            options: Query options
+            options: Query options (service, level, time range, full-text search)
 
         Returns:
-            Logs response with results
+            LogsResponse with matched logs and total count
 
         Raises:
             requests.RequestException: On API error
@@ -293,7 +375,6 @@ class LogTideClient:
             "limit": options.limit,
             "offset": options.offset,
         }
-
         if options.service:
             params["service"] = options.service
         if options.level:
@@ -305,29 +386,28 @@ class LogTideClient:
         if options.to_time:
             params["to"] = options.to_time.isoformat()
 
-        response = requests.get(
-            f"{self.options.api_url}/api/logs",
+        response = self._session.get(
+            f"{self.options.api_url}/api/v1/logs",
             headers=self._get_headers(),
             params=params,
             timeout=30,
         )
         response.raise_for_status()
-
         data = response.json()
         return LogsResponse(logs=data.get("logs", []), total=data.get("total", 0))
 
     def get_by_trace_id(self, trace_id: str) -> List[Dict[str, Any]]:
         """
-        Get logs by trace ID.
+        Get all logs belonging to a trace ID.
 
         Args:
-            trace_id: Trace ID to search for
+            trace_id: Trace ID to look up
 
         Returns:
-            List of log entries
+            List of log entry dicts
         """
-        response = requests.get(
-            f"{self.options.api_url}/api/logs/trace/{trace_id}",
+        response = self._session.get(
+            f"{self.options.api_url}/api/v1/logs/trace/{trace_id}",
             headers=self._get_headers(),
             timeout=30,
         )
@@ -338,31 +418,29 @@ class LogTideClient:
         self, options: AggregatedStatsOptions
     ) -> AggregatedStatsResponse:
         """
-        Get aggregated statistics.
+        Get aggregated log statistics over a time range.
 
         Args:
-            options: Aggregation options
+            options: Time range, interval, and optional service filter
 
         Returns:
-            Aggregated stats response
+            AggregatedStatsResponse with timeseries, top services, and top errors
         """
         params: Dict[str, Any] = {
             "from": options.from_time.isoformat(),
             "to": options.to_time.isoformat(),
             "interval": options.interval,
         }
-
         if options.service:
             params["service"] = options.service
 
-        response = requests.get(
-            f"{self.options.api_url}/api/logs/stats",
+        response = self._session.get(
+            f"{self.options.api_url}/api/v1/logs/aggregated",
             headers=self._get_headers(),
             params=params,
             timeout=30,
         )
         response.raise_for_status()
-
         data = response.json()
         return AggregatedStatsResponse(
             timeseries=data.get("timeseries", []),
@@ -375,132 +453,151 @@ class LogTideClient:
         on_log: Callable[[Dict[str, Any]], None],
         on_error: Optional[Callable[[Exception], None]] = None,
         filters: Optional[Dict[str, str]] = None,
-    ) -> None:
+    ) -> Callable[[], None]:
         """
         Stream logs in real-time via Server-Sent Events.
 
+        Runs in a background daemon thread and returns immediately.
+
         Args:
-            on_log: Callback for each log entry
-            on_error: Optional error callback
-            filters: Optional filters (service, level)
+            on_log: Callback invoked for each incoming log entry dict
+            on_error: Optional callback for connection or parse errors
+            filters: Optional SSE filters, e.g. {'service': 'api', 'level': 'error'}
+
+        Returns:
+            A stop callable — call it to terminate the stream.
 
         Example:
-            def handle_log(log):
-                print(f"{log['level']}: {log['message']}")
-
-            client.stream(on_log=handle_log, filters={'level': 'error'})
+            stop = client.stream(on_log=handle_log, filters={'level': 'error'})
+            # ... later:
+            stop()
         """
-        params = filters or {}
-        url = f"{self.options.api_url}/api/logs/stream"
+        params: Dict[str, str] = dict(filters or {})
+        params["token"] = self.options.api_key
+        url = f"{self.options.api_url}/api/v1/logs/stream"
+        stop_event = Event()
 
-        try:
-            with requests.get(
-                url,
-                headers=self._get_headers(),
-                params=params,
-                stream=True,
-                timeout=None,
-            ) as response:
-                response.raise_for_status()
+        def _run() -> None:
+            try:
+                with self._session.get(
+                    url,
+                    params=params,
+                    stream=True,
+                    timeout=None,
+                    headers=self._get_headers(),
+                ) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if stop_event.is_set():
+                            break
+                        if not line:
+                            continue
+                        line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+                        if line_str.startswith("data: "):
+                            try:
+                                log_data = json.loads(line_str[6:])
+                                on_log(log_data)
+                            except Exception as e:
+                                if on_error:
+                                    on_error(e)
+            except Exception as e:
+                if not stop_event.is_set() and on_error:
+                    on_error(e)
 
-                for line in response.iter_lines():
-                    if not line:
-                        continue
+        t = Thread(target=_run, daemon=True)
+        t.start()
 
-                    line_str = line.decode("utf-8")
-                    if line_str.startswith("data: "):
-                        try:
-                            import json
+        def stop() -> None:
+            stop_event.set()
 
-                            log_data = json.loads(line_str[6:])
-                            on_log(log_data)
-                        except Exception as e:
-                            if on_error:
-                                on_error(e)
+        return stop
 
-        except Exception as e:
-            if on_error:
-                on_error(e)
-            else:
-                raise
+    # -----------------------------------------------------------------------
+    # Metrics
+    # -----------------------------------------------------------------------
 
     def get_metrics(self) -> ClientMetrics:
         """
-        Get SDK metrics.
+        Return a snapshot of the current SDK metrics.
 
         Returns:
-            Current metrics
+            ClientMetrics dataclass with counters and average latency
         """
         with self._metrics_lock:
-            return ClientMetrics(
-                logs_sent=self._metrics.logs_sent,
-                logs_dropped=self._metrics.logs_dropped,
-                errors=self._metrics.errors,
-                retries=self._metrics.retries,
-                avg_latency_ms=self._metrics.avg_latency_ms,
-                circuit_breaker_trips=self._metrics.circuit_breaker_trips,
-            )
+            return dataclasses.replace(self._metrics)
 
     def reset_metrics(self) -> None:
-        """Reset SDK metrics."""
+        """Reset all SDK metrics to zero."""
         with self._metrics_lock:
             self._metrics = ClientMetrics()
             self._latency_window.clear()
 
     def get_circuit_breaker_state(self) -> CircuitState:
         """
-        Get circuit breaker state.
+        Return the current circuit breaker state.
 
         Returns:
-            Current circuit state
+            CircuitState enum value (CLOSED, OPEN, or HALF_OPEN)
         """
         return self._circuit_breaker.state
 
+    # -----------------------------------------------------------------------
+    # Lifecycle
+    # -----------------------------------------------------------------------
+
     def close(self) -> None:
-        """Close client and flush remaining logs."""
+        """Flush remaining logs, cancel the timer, and close the HTTP session."""
         if self._closed:
             return
 
         self._closed = True
 
-        # Cancel flush timer
         if self._flush_timer:
             self._flush_timer.cancel()
 
-        # Flush remaining logs
         self.flush()
+        self._session.close()
 
         if self.options.debug:
             print("[LogTide] Client closed")
 
     def __del__(self) -> None:
-        """Destructor to ensure cleanup."""
-        self.close()
+        """Destructor — ensures cleanup if close() was not called explicitly."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
-    # Private methods
+    # -----------------------------------------------------------------------
+    # Private helpers
+    # -----------------------------------------------------------------------
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Return HTTP headers for all API requests."""
+        return {
+            "X-API-Key": self.options.api_key,
+            "Content-Type": "application/json",
+        }
 
     def _send_logs_with_retry(self, logs: List[LogEntry]) -> None:
-        """Send logs with retry logic and exponential backoff."""
+        """Send a batch of logs with exponential backoff and circuit breaker."""
         attempt = 0
         delay = self.options.retry_delay_ms / 1000.0
+        state_before = self._circuit_breaker.state
 
         while attempt <= self.options.max_retries:
             try:
-                # Check circuit breaker
                 if self._circuit_breaker.state == CircuitState.OPEN:
                     if self.options.debug:
                         print("[LogTide] Circuit breaker open, skipping send")
-
                     with self._metrics_lock:
                         self._metrics.logs_dropped += len(logs)
                     raise CircuitBreakerOpenError("Circuit breaker is open")
 
-                # Send logs
                 start_time = time.time()
                 self._send_logs(logs)
                 latency = (time.time() - start_time) * 1000
 
-                # Record success
                 self._circuit_breaker.record_success()
                 self._update_latency(latency)
 
@@ -513,7 +610,6 @@ class LogTideClient:
                 return
 
             except CircuitBreakerOpenError:
-                # Don't retry if circuit is open
                 break
 
             except Exception as e:
@@ -527,123 +623,100 @@ class LogTideClient:
 
                 if attempt > self.options.max_retries:
                     if self.options.debug:
-                        print(f"[LogTide] Failed to send logs after {attempt} attempts: {e}")
-
+                        print(
+                            f"[LogTide] Failed to send logs after {attempt} attempts: {e}"
+                        )
                     with self._metrics_lock:
                         self._metrics.logs_dropped += len(logs)
                     break
 
-                # Exponential backoff
                 if self.options.debug:
-                    print(f"[LogTide] Retry {attempt}/{self.options.max_retries} in {delay}s")
+                    print(
+                        f"[LogTide] Retry {attempt}/{self.options.max_retries} in {delay}s"
+                    )
+
+                # Abort retries if the client was closed while we were in-flight.
+                # The session is gone — all remaining attempts would fail anyway.
+                if self._closed:
+                    with self._metrics_lock:
+                        self._metrics.logs_dropped += len(logs)
+                    break
 
                 time.sleep(delay)
                 delay *= 2
 
-        # Track circuit breaker trips
-        if self._circuit_breaker.state == CircuitState.OPEN:
+        # Only count a trip when the circuit *transitions* to OPEN during this call,
+        # not on every subsequent call while it's already open.
+        if (self._circuit_breaker.state == CircuitState.OPEN
+                and state_before != CircuitState.OPEN):
             with self._metrics_lock:
                 self._metrics.circuit_breaker_trips += 1
 
     def _send_logs(self, logs: List[LogEntry]) -> None:
-        """
-        Send logs to LogTide API.
-
-        Args:
-            logs: Logs to send
-
-        Raises:
-            requests.RequestException: On API error
-        """
+        """POST a batch of serialized log entries to /api/v1/ingest."""
         payload = {"logs": [log.to_dict() for log in logs]}
-
-        response = requests.post(
-            f"{self.options.api_url}/api/logs",
+        response = self._session.post(
+            f"{self.options.api_url}/api/v1/ingest",
             headers=self._get_headers(),
             json=payload,
             timeout=30,
         )
         response.raise_for_status()
 
-    def _get_headers(self) -> Dict[str, str]:
-        """Get HTTP headers for API requests."""
-        return {
-            "Authorization": f"Bearer {self.options.api_key}",
-            "Content-Type": "application/json",
-        }
-
     def _schedule_flush(self) -> None:
-        """Schedule automatic flush."""
+        """Schedule the next timer-based auto-flush."""
         if self._closed:
             return
-
         interval = self.options.flush_interval / 1000.0
         self._flush_timer = Timer(interval, self._auto_flush)
         self._flush_timer.daemon = True
         self._flush_timer.start()
 
     def _auto_flush(self) -> None:
-        """Auto-flush callback."""
+        """Timer callback: flush then reschedule."""
         if not self._closed:
             self.flush()
             self._schedule_flush()
-
-    def _normalize_trace_id(self, trace_id: str) -> str:
-        """
-        Normalize trace ID.
-
-        Args:
-            trace_id: Input trace ID
-
-        Returns:
-            Normalized trace ID string
-        """
-        # Simply return the trace ID as-is
-        # Accept any string as a valid trace ID
-        return trace_id
 
     def _process_metadata_or_error(
         self, metadata_or_error: Union[Dict[str, Any], Exception, None]
     ) -> Dict[str, Any]:
         """
-        Process metadata or error parameter.
-
-        Args:
-            metadata_or_error: Metadata dict or Exception
-
-        Returns:
-            Metadata dictionary with error serialized if applicable
+        Normalise the metadata_or_error parameter used by error() and critical().
+        Exceptions are serialized to a structured 'exception' key.
         """
         if metadata_or_error is None:
             return {}
-
         if isinstance(metadata_or_error, dict):
             return metadata_or_error
+        return {"exception": serialize_exception(metadata_or_error)}
 
-        # Serialize exception
-        return {
-            "error": {
-                "name": type(metadata_or_error).__name__,
-                "message": str(metadata_or_error),
-                "stack": traceback.format_exc(),
+    def _apply_payload_limits(self, entry: LogEntry) -> None:
+        """Enforce payload limits on entry.metadata in-place."""
+        if not entry.metadata:
+            return
+
+        lim = self._payload_limits
+        entry.metadata = _process_value(entry.metadata, "root", lim)
+
+        # Enforce total entry size
+        raw = json.dumps(entry.to_dict())
+        if len(raw.encode()) > lim.max_log_size:
+            if self.options.debug:
+                print(
+                    f"[LogTide] Log entry too large ({len(raw)} bytes), truncating metadata"
+                )
+            entry.metadata = {
+                "_truncated": True,
+                "_original_size": len(raw.encode()),
             }
-        }
 
     def _update_latency(self, latency: float) -> None:
-        """
-        Update latency metrics with rolling window.
-
-        Args:
-            latency: Latency in milliseconds
-        """
+        """Update the rolling average latency (100-sample window)."""
         with self._metrics_lock:
             self._latency_window.append(latency)
-
-            # Keep window size at 100
             if len(self._latency_window) > 100:
                 self._latency_window.pop(0)
-
-            # Calculate average
             if self._latency_window:
                 self._metrics.avg_latency_ms = sum(self._latency_window) / len(
                     self._latency_window

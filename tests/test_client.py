@@ -94,7 +94,7 @@ def test_auto_trace_id():
 
 
 def test_error_serialization():
-    """Test error serialization."""
+    """Test error serialization produces structured exception metadata."""
     client = LogTideClient(
         ClientOptions(
             api_url="http://localhost:8080",
@@ -107,15 +107,17 @@ def test_error_serialization():
     except Exception as e:
         client.error("test", "Error occurred", e)
 
-    assert "error" in client._buffer[0].metadata
-    assert client._buffer[0].metadata["error"]["name"] == "ValueError"
-    assert client._buffer[0].metadata["error"]["message"] == "Test error"
+    exc = client._buffer[0].metadata["exception"]
+    assert exc["type"] == "ValueError"
+    assert exc["message"] == "Test error"
+    assert exc["language"] == "python"
+    assert isinstance(exc["stacktrace"], list)
 
     client.close()
 
 
 def test_buffer_management():
-    """Test buffer size limits."""
+    """Test buffer size limits: logs are silently dropped when full."""
     client = LogTideClient(
         ClientOptions(
             api_url="http://localhost:8080",
@@ -124,16 +126,14 @@ def test_buffer_management():
         )
     )
 
-    # Fill buffer
     for i in range(5):
         client.info("test", f"Message {i}")
 
-    # Should raise BufferFullError
-    try:
-        client.info("test", "Message 6")
-        assert False, "Should have raised BufferFullError"
-    except Exception as e:
-        assert "buffer is full" in str(e).lower()
+    # Buffer is now at capacity — 6th log must be dropped, not raise
+    client.info("test", "Message 6")
+
+    assert len(client._buffer) == 5
+    assert client.get_metrics().logs_dropped == 1
 
     client.close()
 

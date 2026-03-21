@@ -53,7 +53,9 @@ class CircuitBreaker:
             self._failure_count += 1
             self._last_failure_time = time.time()
 
-            if self._failure_count >= self.threshold:
+            # A single failure in HALF_OPEN immediately re-opens the circuit.
+            # In CLOSED state, only open once the threshold is reached.
+            if self._state == CircuitState.HALF_OPEN or self._failure_count >= self.threshold:
                 self._state = CircuitState.OPEN
 
     def call(self, func: Callable[[], T]) -> T:
