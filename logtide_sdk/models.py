@@ -31,18 +31,22 @@ class LogEntry:
     def __post_init__(self) -> None:
         """Initialize default values."""
         if self.time is None:
-            self.time = datetime.now(timezone.utc).isoformat()
+            self.time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        elif self.time.endswith("+00:00"):
+            self.time = self.time[:-6] + "Z"
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return {
+        result: Dict[str, Any] = {
             "service": self.service,
             "level": self.level.value,
             "message": self.message,
             "time": self.time,
             "metadata": self.metadata,
-            "trace_id": self.trace_id,
         }
+        if self.trace_id is not None:
+            result["trace_id"] = self.trace_id
+        return result
 
 
 @dataclass
