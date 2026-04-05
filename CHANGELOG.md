@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-04-06
+
+### Fixed
+
+- Use `Z` suffix for UTC timestamps instead of `+00:00` to match server schema requirements
+- Normalize caller-supplied `+00:00` offsets to `Z` in `LogEntry.__post_init__`
+- Omit `trace_id` from `to_dict()` when `None` — server rejects null values
+
+### Contributors
+
+- [@TomatoInOil](https://github.com/TomatoInOil) — [#4](https://github.com/logtide-dev/logtide-python/pull/4)
+
 ## [0.8.4] - 2026-03-21
 
 ### Added
@@ -79,5 +91,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - FastAPI middleware for auto-logging HTTP requests
 - Full type hints support for Python 3.8+
 
+[0.8.5]: https://github.com/logtide-dev/logtide-python/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/logtide-dev/logtide-python/compare/v0.1.0...v0.8.4
 [0.1.0]: https://github.com/logtide-dev/logtide-python/releases/tag/v0.1.0
